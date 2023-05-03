@@ -1,168 +1,352 @@
+import copy
 import random
-import numpy as np
 from datetime import timedelta, datetime
 
+import numpy as np
+import pandas as pd
+
 import lib.parameters as para
+from lib.parameters import (
+    ProbOptions,
+    ReadInputData,
+    SetTimes,
+    UserInfo
+)
 
 
-class Auction:
-    def __init__(self, options: para.ProbOptions, IFN: para.ReadInputData, ST: para.SetTimes, UI: para.UserInfo):
-        self.highest_block_price = IFN.tariff_table[IFN.tariff_table['비고'] == options.season].loc[:, ['저압, 전력량', '고압, 전력량']].max().max()
+def _set_block_step(net_ToC, tariff_season):
+    tariff_block = tariff_season[net_ToC < tariff_season.loc[:, "max"]].iloc[0, :]
+    return tariff_block.name
 
-        # 결과 book 초기값 설정
-        self.result_book = dict()
-        for d in range(ST.first_day.day, ST.last_day.day + 1):
-            for h_resolution in ST.trading_time.keys():
-                self.result_book[f"{d}-{h_resolution}"] = dict()
-                for u in UI.Users.keys():
-                    self.result_book[f"{d}-{h_resolution}"][u] = self.set_result_book(0, 0)
 
-        self.auction_book = dict()
-        self.pre_market_order = dict()
-        for d in range((ST.last_day - ST.first_day).days + 1):
-            open_day = (ST.first_day + timedelta(days=d)).strftime("%m-%d")
-            for h_resolution in ST.trading_time.keys():
-                self.auction_book[f"{open_day}-{h_resolution}"] = dict()    # auction 개장 날짜에 대한 pool 생성
+def _bid_by_strategy(
+        options:ProbOptions,
+        player_info,
+        strategy,
+        clearing_price=None
+):
+    def _bid_randomly(player_info):
+        bid_pool = dict()
+        for u in random.sample(list(player_info.keys()), len(player_info)):
+            for i in range(abs(player_info[u]['quantity'])):
+                bid_pool[f"{u},{i},{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"] = \
+                    np.random.uniform(player_info[u]['lower_price'], player_info[u]['upper_price'])
+        return pd.DataFrame(bid_pool.values(), index=bid_pool.keys(), columns=['bid'])
 
-                self.market_rates = np.mean(IFN.smp_data.loc[open_day, [f"{h}h" for h in ST.trading_time[h_resolution]]])
-                self.auction_book[f"{open_day}-{h_resolution}"]['market rates'] = self.market_rates     # auction 날짜에 대한 시장 평균 가격 넣기
-
-                # self.auction_book[f"{open_day}-{h_resolution}"]['buyer clearing price'] = 0
-                # self.auction_book[f"{open_day}-{h_resolution}"]['seller clearing price'] = 0
-                self.market_book = dict()
-                self.market_book['buyers'] = dict()
-                self.market_book['sellers'] = dict()
-
-                self.divide_agent(open_day, h_resolution, options, UI, ST, IFN)    # User를 구매자, 판매자로 분류하여 bidding 크기와 bidding price의 상한선을 agent 별로 설정
-
-                # auction 시작
-                trading_amount = abs(sum([self.market_book['sellers'][k]['quantity'] for k in self.market_book['sellers'].keys()]))
-                if trading_amount == 0:
-                    self.auction_book[f"{open_day}-{h_resolution}"]['clearing price'] = 0
-                else:
-                    for i in range(trading_amount):
-                        buyers = [b for b in self.market_book['buyers'] if self.market_book['buyers'][b]['quantity'] > 0]
-                        sellers = [s for s in self.market_book['sellers'] if self.market_book['sellers'][s]['quantity'] < 0]
-
-                        orders_of_buyer = []
-                        orders_of_seller = []
-                        for b in random.sample(buyers, len(buyers)):
-                            orders_of_buyer.append(self.set_buyer_order_book(open_day=open_day,
-                                                                             h_resolution=h_resolution,
-                                                                             options=options,
-                                                                             user=b,
-                                                                             bidding_Q=1,
-                                                                             bidding_T=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                                                                             )
-                                                   )
-            # randomly 하게 bidding price를 agent별로 설정. 단, historic winning price가 있을 경우, 해당 값을 이용하여 bidding price 결정
-                # winning bidding이 없을 경우, 최대 5번까지 auction 수행
-                # natural ordering 수행
-                # clearing price 결정 및 정산 수행
-
-    def extract_positive_margin(self):
-        while True:
-            margin = np.random.normal(0.2, 0.15)
-            if margin > 0:
-                break
-            else:
+    def _bid_update(player_info):
+        """
+        if historic bid >= historic clearing price
+         - buyer:
+        """
+        bid_pool = dict()
+        for u in random.sample(list(player_info.keys()), len(player_info)):
+            if player_info[u]['historic_bid'] is np.nan:
                 pass
-        return margin
 
-    def set_buyer_order_book(self, open_day, h_resolution, options: para.ProbOptions, user, bidding_Q, bidding_T):
-        if options.bidding_strategy == 'Randomly':
-            bidding_P = np.random.uniform(self.market_book['buyers'][user]['lower price'],
-                                  self.market_book['buyers'][user]['upper price'])
-        elif options.bidding_strategy == 'Update margin':
-            if (open_day == '01-01' and h_resolution == 1) or pre_market_order == dict():
-                bidding_P = np.random.uniform(self.market_book['buyers'][user]['lower price'],
-                                      self.market_book['buyers'][user]['upper price'])
+            elif clearing_price <= player_info[u]['historic_bid'] <= player_info[u]['upper_price']:
+                adjusted = \
+                    player_info[u]['historic_bid'] - \
+                    (player_info[u]['historic_bid'] - clearing_price) * options.extract_margin_rate()
+                for i in range(abs(player_info[u]['quantity'])):
+                    bid_pool[f"{u},{i},{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"] = \
+                        np.random.uniform(
+                            low=player_info[u]['lower_price'],
+                            high=adjusted
+                        )
+
+            elif player_info[u]['historic_bid'] <= clearing_price <= player_info[u]['upper_price']:
+                adjusted = \
+                    player_info[u]['historic_bid'] + \
+                    (clearing_price - player_info[u]['historic_bid']) * options.extract_margin_rate()
+                for i in range(abs(player_info[u]['quantity'])):
+                    bid_pool[f"{u},{i},{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"] = \
+                        np.random.uniform(
+                            low=adjusted,
+                            high=player_info[u]['upper_price']
+                        )
+
+            elif player_info[u]['historic_bid'] <= player_info[u]['upper_price'] <= clearing_price:
+                adjusted = \
+                    player_info[u]['historic_bid'] + \
+                    (clearing_price - player_info[u]['historic_bid']) * options.extract_margin_rate()
+                # 조절된 값이 상한 입찰가를 초과할 경우, 입찰가는 상한입찰가로 입찰하도록 설정
+                if adjusted > player_info[u]['upper_price']:
+                    adjusted = player_info[u]['upper_price']
+                for i in range(abs(player_info[u]['quantity'])):
+                    bid_pool[f"{u},{i},{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"] = \
+                        np.random.uniform(
+                            low=adjusted,
+                            high=player_info[u]['upper_price']
+                        )
+
             else:
-                margin = self.extract_positive_margin()
-                if pre_market_order['buyers'][user]['bidding price'] < pre_market_order['clearing price']:  # 이전 옥션에서 낙찰됨
-                    bidding_P = pre_market_order['buyers'][user]['bidding price'] * (1 - margin)
-                    if bidding_P < self.market_book['buyers'][user]['lower price']:
-                        bidding_P = self.market_book['buyers'][user]['lower price']
-                    else:
-                        pass
-                else:   # 이전 옥션에서 낙찰받지 못함
-                    bidding_P = pre_market_order['buyers'][user]['bidding price'] * (1 + margin)
-                    if bidding_P > self.market_book['buyers'][user]['upper price']:
-                        bidding_P = self.market_book['buyers'][user]['upper price']
-                    else:
-                        pass
+                print("error: 알 수 없는 조건")
+                print(f"user:{u}에서 문제 발생")
 
-        return {'name': user,
-                'bidding_P': bidding_P,
-                'bidding_Q': bidding_Q,
-                'bidding_T': bidding_T
-                }
-
-
-    def set_result_book(self,P, Q):
-        return {'P_winning': P,
-                'Q_winning': Q
-                }
-
-    # def set_Market_book(self, open_day, h_resolution, ST):
-    #     return {'open day-hours': [f"{open_day}-{h}" for h in ST.trading_time[h_resolution]],
-    #             'clearing price': 0,
-    #             'buyers': {},
-    #             'sellers': {}
-    #             }
-
-    def set_PQ_book(self, q, upper_p, lower_p):
-        return {'quantity': q,
-                'upper price': upper_p,
-                'lower price': lower_p
-                }
-
-    def set_vol_level(self, user, UI: para.UserInfo):
-        contract_power = max(UI.Users[user]['Electricity_Consumption'].values())
-        if contract_power <= 3:
-            vol_level = '저압'
+        if bid_pool == dict():
+            return pd.DataFrame([], index=bid_pool.keys(), columns=['bid'])
         else:
-            vol_level = '고압'
-        return vol_level
+            return pd.DataFrame(bid_pool.values(), index=bid_pool.keys(), columns=['bid'])
 
-    def set_block_step(self, user, UI: para.UserInfo, options: para.ProbOptions, IFN: para.ReadInputData):
-        amount = UI.Users[user]['Total_amount_of_consumption'] - \
-                 sum([self.result_book[h][user]['Q_winning'] for h in self.result_book.keys() for u in self.result_book[h].keys() if u == user])
-        tariff_season = IFN.tariff_table[IFN.tariff_table['비고'] == options.season]
-        tariff_block = tariff_season[amount < tariff_season.loc[:, "max"]].iloc[0, :]
-        return tariff_block.name
+    if strategy == 'Randomly':
+        return _bid_randomly(player_info)
 
-    def divide_agent(self, open_day, h_resolution, options: para.ProbOptions, UI: para.UserInfo, ST: para.SetTimes, IFN: para.ReadInputData):
+    elif strategy == 'Update margin':
+        if clearing_price is None:
+            return _bid_randomly(player_info)
+        else:
+            return _bid_update(player_info)
+
+
+def _market_price(
+        auction_mechanism,
+        bid_buyer_pool,
+        bid_seller_pool
+):
+
+    # breakeven index 결정 (동일 index의 구매자의 입찰가가 판매자의 입찰가보다 큰 것 중 가장 높은 index)
+    if bid_buyer_pool.shape[0] >= bid_seller_pool.shape[0]:
+        pass_margin = bid_seller_pool.shape[0]
+        breakeven_index = np.where(bid_buyer_pool.iloc[:pass_margin, 0].values >= bid_seller_pool.iloc[:, 0].values)[0][-1]
+
+    else:
+        pass_margin = bid_buyer_pool.shape[0]
+        breakeven_index = np.where(bid_buyer_pool.iloc[:, 0].values >= bid_seller_pool.iloc[:pass_margin, 0].values)[0][-1]
+
+    if auction_mechanism == 'VCG':
+        buyer_breakeven_price = bid_buyer_pool.iloc[breakeven_index, 0]
+        seller_breakeven_price = bid_seller_pool.iloc[breakeven_index, 0]
+
+        if breakeven_index + 1 == bid_buyer_pool.shape[0]:
+            buyer_next_price = bid_buyer_pool.iloc[breakeven_index, 0]
+        else:
+            buyer_next_price = bid_buyer_pool.iloc[breakeven_index + 1, 0]
+
+        if breakeven_index + 1 == bid_seller_pool.shape[0]:
+            seller_next_price = bid_seller_pool.iloc[breakeven_index, 0]
+        else:
+            seller_next_price = bid_seller_pool.iloc[breakeven_index + 1, 0]
+
+        buyer_market_price = max(seller_breakeven_price, buyer_next_price)
+        seller_market_prcie = min(seller_next_price, buyer_breakeven_price)
+
+    return buyer_market_price, seller_market_prcie, breakeven_index
+
+
+
+def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: UserInfo):
+    """
+    users 옥션 결과 book frame 생성 및 초기값 입력
+    """
+    users_book = dict()
+    for d, h_resolution in ST.date_list_resol:
+        open_day = (ST.first_day + timedelta(days=d - 1)).strftime("%m-%d")
+        date_resolution = f"{open_day}-{h_resolution}"
+        users_book[date_resolution] = dict()
+        for u in UI.Users.keys():
+            users_book[date_resolution][u] = \
+                {
+                    'P_winning': [],
+                    'Q_winning': [],
+                    'cummul_Q': 0
+                }
+
+    """
+    옥션 시작
+    """
+    auction_book = dict()
+    date_list = []
+    for d, h_resolution in ST.date_list_resol:
+        open_day = (ST.first_day + timedelta(days=d-1)).strftime("%m-%d")
+        date_resolution = f"{open_day}-{h_resolution}"
+        date_list.append(date_resolution)
+
+        """
+        거래 시간 별 및 거래 참여자 별 입찰서 book 생성
+        """
+        # auction 개장 "일자 - 거래 시점"에 대한 book 생성
+        auction_book[date_resolution] = dict()
+
+        # 시장 평균 가격 (평균 SMP)
+        market_price = np.mean(IFN.smp_data.loc[open_day, [f"{h}h" for h in ST.trading_time[h_resolution]]])
+
+        # auction book으로 거래시점 별 평균 시장 가격 입력
+        auction_book[date_resolution]['market-price'] = market_price
+        auction_book[date_resolution]['buyers'] = dict()
+        auction_book[date_resolution]['sellers'] = dict()
+
+        """
+        옥션 참가자(buyer, seller)의 각 입찰량 및 입찰상한가격, 입찰하한가격 결정 
+        """
         for user in UI.Users.keys():
-            if UI.Users[user]['Gen_bin'] == 1:
-                netload = [v - UI.Users[user]['Generation'][k]
-                           for k, v in UI.Users[user]['Electricity_Consumption'].items()
-                           if k[0] == int(open_day.split('-')[1]) and k[1] in ST.trading_time[h_resolution]]
-            else:
-                netload = [v
-                           for k, v in UI.Users[user]['Electricity_Consumption'].items()
-                           if k[0] == int(open_day.split('-')[1]) and k[1] in ST.trading_time[h_resolution]]
+            quantity = \
+                int(
+                    UI.Users[user]['Electricity_Consumption'][d, h_resolution] -
+                    UI.Users[user]['Generation'][d, h_resolution]
+                )
 
-            excess_E = int(sum([k for k in netload if k < 0]))      # 소수점 이하 절사
-            if excess_E < 0:
-                self.market_book['sellers'][user] = self.set_PQ_book(excess_E,
-                                                                     self.highest_block_price,
-                                                                     self.market_rates
-                                                                     )
+
+            # resolution된 시간대의 netload의 합으로 판매량 결정
+            # 동일 resolution에서는 자신의 전력량을 낮춘다고 가정
+            # 즉, 공급과잉량에 대해서 판매자는 시장가격으로 정산을 받거나 또는 구매자에게 파는 것만을 고려해야 함.
+            # 자신의 누진단계를 낮추도록 할 수 없음. (즉, 상계거래 폐지)
+
+            if quantity < 0:
+                auction_book[date_resolution]['sellers'][user] = \
+                    {
+                        'quantity': quantity,
+                        'upper_price': ST.highest_block_price,
+                        'lower_price': market_price
+                    }
+
             else:
-                vol_level = self.set_vol_level(user, UI)
-                block_name = self.set_block_step(user, UI, options, IFN)
-                upper_P = IFN.tariff_table[IFN.tariff_table['비고'] == options.season].loc[block_name, [f"{vol_level}, 전력량"]].iloc[0]
-                if upper_P >= self.market_rates:
-                    lower_P = self.market_rates
+
+                # 낙찰량(구매자에서 낙찰된 양)을 뺀 순소비량에 대해서 누진단계 결정
+                block_name = \
+                    _set_block_step(
+                        net_ToC=
+                        sum(
+                            UI.Users[user]['Net_consumption'].values()
+                        ) -
+                        sum(
+                            [users_book[date][user]['cummul_Q']
+                             for date in date_list
+                             if users_book[date][user]['cummul_Q'] > 0]
+                        ),
+                        tariff_season=ST.tariff_season
+                    )
+
+                upper_price = ST.tariff_season.loc[block_name, [f"{UI.Users[user]['Vol_level']}, 전력량"]].iloc[0]
+
+                if upper_price >= market_price:
+                    lower_price = market_price
                 else:
-                    lower_P = upper_P
-                self.market_book['buyers'][user] = self.set_PQ_book(int(sum([k for k in netload if k > 0])),
-                                                                    upper_P,
-                                                                    lower_P
-                                                                    )
+                    lower_price = upper_price
+
+                auction_book[date_resolution]['buyers'][user] = \
+                    {
+                        'quantity': quantity,
+                        'upper_price': upper_price,
+                        'lower_price': lower_price
+                    }
 
 
+        # 거래량 산출
+        trading_amount = \
+            abs(
+                sum(
+                    [auction_book[date_resolution]['sellers'][u]['quantity']
+                     for u in auction_book[date_resolution]['sellers'].keys()]
+                )
+            )
+        # 판매 물량이 없을 경우, 거래 종료
+        if trading_amount == 0:
+            auction_book[date_resolution]['clearing-price'] = 0
 
+        else:
+            # 임시의 입찰 정보 --> (가변함)
+            buyer_info_temp = copy.deepcopy(auction_book[date_resolution]['buyers'])
+            seller_info_temp = copy.deepcopy(auction_book[date_resolution]['sellers'])
+            buyer_clearing_price = None
+            seller_clearing_price = None
+            for open_num in range(options.number_of_market_open):
 
-    # def classify_users(self, trading_day, trading_time, Users):
+                # 입찰 전략에 따른 입찰가 생성
+                bid_buyer_pool = _bid_by_strategy(
+                    options=options,
+                    player_info=buyer_info_temp,
+                    strategy=options.bidding_strategy,
+                    clearing_price=buyer_clearing_price
+                )
+
+                bid_seller_pool = _bid_by_strategy(
+                    options=options,
+                    player_info=seller_info_temp,
+                    strategy=options.bidding_strategy,
+                    clearing_price=seller_clearing_price
+                )
+
+                if bid_buyer_pool.shape[0] == 0 or bid_seller_pool.shape[0] == 0:
+                    break
+
+                # natural ordering을 통한 입찰가 정렬 (buyer: descending order, seller: descending order)
+                bid_buyer_pool = \
+                    bid_buyer_pool.sort_values('bid', ascending=False)
+
+                bid_seller_pool = \
+                    bid_seller_pool.sort_values('bid', ascending=True)
+
+                # market clearing 방식에 따른 market price 결정
+                try:
+                    buyer_clearing_price, seller_clearing_price, breakeven_index = \
+                        _market_price(
+                            options.auction_mechanism,
+                            bid_buyer_pool,
+                            bid_seller_pool
+                        )
+                # 구매자 또는 판매자의 모든 입찰가가 counterpart의 입찰가와 매칭되지 않을 경우
+                except IndexError:
+                    break
+
+                """
+                낙찰된 구매자 및 판매자의 정산
+                """
+                # buyer-Market-clearing [결정된 시장 가격에 따른 clearing 단계]
+                winning_player = []
+
+                bid_buyer_pool['name'] = \
+                    [x.split(',')[0] for x in list(bid_buyer_pool.index)]
+                buyer_count_df = bid_buyer_pool.iloc[:breakeven_index+1, :].groupby('name').count()
+                for user in buyer_count_df.index:
+                    users_book[date_resolution][user]['Q_winning'].append(
+                        buyer_count_df.loc[user, 'bid']
+                    )
+                    users_book[date_resolution][user]['P_winning'].append(
+                        buyer_count_df.loc[user, 'bid'] * buyer_clearing_price
+                    )
+                    users_book[date_resolution][user]['cummul_Q'] = \
+                        sum(users_book[date_resolution][user]['Q_winning'])
+                    winning_player.append(user)
+
+                # seller-Market-clearing [결정된 시장 가격에 따른 clearing 단계]
+                bid_seller_pool['name'] = \
+                    [x.split(',')[0] for x in list(bid_seller_pool.index)]
+                seller_count_df = bid_seller_pool.iloc[:breakeven_index+1, :].groupby('name').count()
+                for user in seller_count_df.index:
+                    users_book[date_resolution][user]['Q_winning'].append(
+                        - seller_count_df.loc[user, 'bid']
+                    )
+                    users_book[date_resolution][user]['P_winning'].append(
+                        - seller_count_df.loc[user, 'bid'] * seller_clearing_price
+                    )
+                    users_book[date_resolution][user]['cummul_Q'] = \
+                        sum(users_book[date_resolution][user]['Q_winning'])
+                    winning_player.append(user)
+
+                for user in list(set(UI.Users.keys()) - set(winning_player)):
+                    users_book[date_resolution][user]['Q_winning'].append(
+                        0
+                    )
+                    users_book[date_resolution][user]['P_winning'].append(
+                        0
+                    )
+                    users_book[date_resolution][user]['cummul_Q'] = \
+                        sum(users_book[date_resolution][user]['Q_winning'])
+
+                """
+                이전 market에 입찰가 중 평균 입찰가를 historic bid로 결정
+                """
+                for user in buyer_info_temp.keys():
+                    buyer_info_temp[user]['quantity'] = \
+                        auction_book[date_resolution]['buyers'][user]['quantity'] - \
+                        users_book[date_resolution][user]['cummul_Q']
+                    buyer_info_temp[user]['historic_bid'] = \
+                        bid_buyer_pool[bid_buyer_pool.name == user]['bid'].mean()
+                for user in seller_info_temp.keys():
+                    seller_info_temp[user]['quantity'] = \
+                        auction_book[date_resolution]['sellers'][user]['quantity'] - \
+                        users_book[date_resolution][user]['cummul_Q']
+                    seller_info_temp[user]['historic_bid'] = \
+                        bid_seller_pool[bid_seller_pool.name == user]['bid'].mean()
+
+    return auction_book, users_book

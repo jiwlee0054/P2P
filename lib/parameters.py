@@ -15,12 +15,18 @@ class ProbOptions:
 
         self.year = 2021
         self.month = 1
-        self.season = self.set_season()
 
         self.demand_noise_dist_deviation_ratio = 0.3
         self.trading_time_option = 'Time-of-Use'
+
+        """
+        
+        Vickrey-Clark-Groves(VCG)
+        """
         self.auction_mechanism = 'VCG'
 
+        # 거래 시점별 거래 반복 횟수
+        self.number_of_market_open = 5
         """
         입찰 전략 선택
         1. Randomly
@@ -28,13 +34,13 @@ class ProbOptions:
         """
         self.bidding_strategy = 'Update margin'
 
-        self.loc_data = f"../data"
+        self.loc_data = f"data"
 
-    def set_season(self):
-        if self.month == 7 or self.month == 8:
-            return '하계'
-        else:
-            return '기타'
+
+
+    def extract_margin_rate(self):
+        return abs(np.random.normal(0.2, 0.15))
+
 
 class ReadInputData:
     def __init__(self, options: ProbOptions):
@@ -100,13 +106,21 @@ def make_generation_pattern(IFN):
 
 
 class SetTimes:
-    def __init__(self, options: ProbOptions):
+    def __init__(self, options: ProbOptions, IFN:ReadInputData):
         this_month = datetime(year=options.year, month=options.month, day=1).date()
         next_month = this_month + relativedelta.relativedelta(months=1)
         self.first_day = this_month
         self.last_day = next_month - timedelta(days=1)
 
         self.set_trading_time(options)
+        self.date_list = [(d, h) for d in range(self.first_day.day, self.last_day.day + 1)
+                          for h in range(1, 24 + 1)]
+        self.date_list_resol = [(d, h_resolution) for d in range(self.first_day.day, self.last_day.day + 1)
+                                for h_resolution in self.trading_time.keys()]
+        self.season = self.set_season(options)
+        self.tariff_season = IFN.tariff_table[IFN.tariff_table['비고'] == self.season]
+        self.highest_block_price = \
+            IFN.tariff_table[IFN.tariff_table['비고'] == self.season].loc[:, ['저압, 전력량', '고압, 전력량']].max().max()
 
     def set_trading_time(self, options):
         trading_time_dict = dict()
@@ -121,27 +135,37 @@ class SetTimes:
                 trading_time_dict[3] = [12, 14, 15, 16, 17, 18]
         self.trading_time = trading_time_dict
 
+    def set_season(self, options:ProbOptions):
+        if options.month == 7 or options.month == 8:
+            return '하계'
+        else:
+            return '기타'
+
 
 class UserInfo:
     def __init__(self, options: ProbOptions, IFN:ReadInputData, ST: SetTimes, Gen_prob_pattern):
-        self.items = ['Gen_bin',
-                      'Electricity_Consumption',
-                      'Generation',
-                      'Block_step_old',
-                      'Total_amount_of_consumption',
-                      'Demand_charge',
-                      'Energy_charge',
-                      'Installed_Cap'
-                      ]
+        self.items = [
+            'Gen_bin',
+            'Electricity_Consumption',
+            'Generation',
+            'Feed_in',
+            'Net_consumption',
+            'Block_step_old',
+            'Demand_charge',
+            'Energy_charge',
+            'Installed_Cap',
+            'Vol_level'
+        ]
 
         self.first_day = ST.first_day
         self.last_day = ST.last_day
 
         # Users SET 만들기
         self.make_users_set(options)
-        self.put_consumption_to_Users(options, IFN)
-        self.put_generation_to_Users(Gen_prob_pattern, IFN)
-        self.put_TariffInfo_to_Users(options, IFN)
+        self.put_consumption_to_Users(options, IFN, ST)
+        self.put_generation_to_Users(Gen_prob_pattern, IFN, ST)
+        self.put_NetInfo_to_Users(ST)
+        self.put_TariffInfo_to_Users(options, IFN, ST)
 
     def make_users_set(self, options):
         Users = dict()
@@ -164,14 +188,24 @@ class UserInfo:
 
         self.Users = Users_sorted
 
-    def put_consumption_to_Users(self, options, IFN):
+    def put_consumption_to_Users(self, options:ProbOptions, IFN:ReadInputData, ST:SetTimes):
         for u in self.Users.keys():
-            Demand_date_factor = self.make_random_demand_factor(options, IFN)
-            consumption_pattern, electricity_amount = self.make_electricity_consumption_pattern_by_user(IFN, Demand_date_factor)
-            self.Users[u]['Electricity_Consumption'] = consumption_pattern
-            self.Users[u]['Total_amount_of_consumption'] = electricity_amount
+            demand_date_factor = self.make_random_demand_factor(options, IFN)
+            consumption_pattern = self.make_electricity_consumption_pattern_by_user(IFN, demand_date_factor)
 
-    def put_generation_to_Users(self, Gen_prob_pattern, IFN):
+            consumption_pattern_resol = dict()
+            for d, h_resolution in ST.date_list_resol:
+                consumption_pattern_resol[d, h_resolution] = \
+                    float(
+                        sum(
+                            [consumption_pattern[d, h_] for h_ in ST.trading_time[h_resolution]]
+                        )
+                    )
+
+            self.Users[u]['Electricity_Consumption'] = consumption_pattern_resol
+            self.Users[u]['Vol_level'] = '저압' if max(consumption_pattern.values()) <= 3 else '고압'
+
+    def put_generation_to_Users(self, Gen_prob_pattern, IFN:ReadInputData, ST:SetTimes):
         gen_prob_pattern_dict = self.make_gen_pattern_dict(Gen_prob_pattern)
         for u in self.Users.keys():
             if self.Users[u]['Gen_bin'] == 1:
@@ -182,25 +216,56 @@ class UserInfo:
                         break
                     else:
                         pass
-                self.Users[u]['Generation'] = dict(zip(gen_prob_pattern_dict.keys(), map(lambda x:x[1] * cap_rand,
-                                                                                         gen_prob_pattern_dict.items())))
-                self.Users[u]['Installed_Cap'] = cap_rand
+
+                self.Users[u]['Installed_Cap'] = float(cap_rand)
             else:
+                cap_rand = 0
                 self.Users[u]['Installed_Cap'] = 0
 
-    def put_TariffInfo_to_Users(self, options, IFN):
+
+            generation_resol = dict()
+            for d, h_resolution in ST.date_list_resol:
+                generation_resol[d, h_resolution] = \
+                    float(sum([gen_prob_pattern_dict[d, h_] * cap_rand for h_ in ST.trading_time[h_resolution]]))
+
+            self.Users[u]['Generation'] = generation_resol
+
+    def put_NetInfo_to_Users(self, ST:SetTimes):
         for u in self.Users.keys():
+            self.Users[u]['Feed_in'] = dict()
+            self.Users[u]['Net_consumption'] = dict()
+            for date in ST.date_list_resol:
+                if self.Users[u]['Gen_bin'] == 1:
+                    if self.Users[u]['Electricity_Consumption'][date] >= self.Users[u]['Generation'][date]:
+                        self.Users[u]['Feed_in'][date] = 0
+                        self.Users[u]['Net_consumption'][date] = self.Users[u]['Electricity_Consumption'][date] - \
+                                                                 self.Users[u]['Generation'][date]
+                    else:
+                        self.Users[u]['Feed_in'][date] = self.Users[u]['Generation'][date] - \
+                                                         self.Users[u]['Electricity_Consumption'][date]
+                        self.Users[u]['Net_consumption'][date] = 0
+                else:
+                    self.Users[u]['Feed_in'][date] = 0
+                    self.Users[u]['Net_consumption'][date] = self.Users[u]['Electricity_Consumption'][date]
+
+    def put_TariffInfo_to_Users(self, options, IFN, ST):
+        for u in self.Users.keys():
+            # prosumer의 계약전력은 순소비패턴이 아닌 실제 소비패턴으로 결정
             contract_voltage = max(self.Users[u]['Electricity_Consumption'].values())
             if contract_voltage <= 3:
                 vol_level = '저압'
             else:
                 vol_level = '고압'
-            amount = self.Users[u]['Total_amount_of_consumption']
-            block = IFN.tariff_table[IFN.tariff_table['비고'] == options.season][amount < IFN.tariff_table[IFN.tariff_table['비고'] == options.season].loc[:, "max"]].iloc[0, :]
+            if self.Users[u]['Gen_bin'] == 1:
+                amount = sum(self.Users[u]['Net_consumption'].values())
+            else:
+                amount = sum(self.Users[u]['Electricity_Consumption'].values())
+
+            block = IFN.tariff_table[IFN.tariff_table['비고'] == ST.season][amount < IFN.tariff_table[IFN.tariff_table['비고'] == ST.season].loc[:, "max"]].iloc[0, :]
             step = block.name
             demand_charge = block[f"{vol_level}, 기본"]
 
-            block_lower = IFN.tariff_table[IFN.tariff_table['비고'] == options.season][amount >= IFN.tariff_table[IFN.tariff_table['비고'] == options.season].loc[:, "max"]]
+            block_lower = IFN.tariff_table[IFN.tariff_table['비고'] == ST.season][amount >= IFN.tariff_table[IFN.tariff_table['비고'] == ST.season].loc[:, "max"]]
             energy_charge = 0
             max_val = 0
             for i in block_lower.index:
@@ -217,11 +282,11 @@ class UserInfo:
         gen_prob_pattern_dict = dict()
         for d in range(self.first_day.day, self.last_day.day + 1):
             for h in range(1, 25):
-                gen_prob_pattern_dict[d, h] = Gen_prob_pattern.loc[d, h]
+                gen_prob_pattern_dict[d, h] = float(Gen_prob_pattern.loc[d, h])
 
         return gen_prob_pattern_dict
 
-    def make_random_demand_factor(self, options, IFN):
+    def make_random_demand_factor(self, options:ProbOptions, IFN:ReadInputData):
         def what_day_is_it(date):
             days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
             day = date.weekday()
@@ -261,4 +326,4 @@ class UserInfo:
             # h = int(k.split(',')[1].split(')')[0])
             consumption_pattern[k] = Demand_date_factor[k] * (electricity_amount / factor_sum)
 
-        return consumption_pattern, electricity_amount
+        return consumption_pattern
