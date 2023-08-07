@@ -5,33 +5,36 @@ from lib.parameters import (
     UserInfo
 )
 
-from lib.parameters import (
-    make_generation_pattern
-)
-
 from lib.auction_oper_model import (
     market_clearing
 )
 
 
 if __name__ == '__main__':
-    options = ProbOptions()
+    input_data_name = "casestudy_10households"
+    options = ProbOptions(input_data_name)
     IFN = ReadInputData(options)
-    Gen_prob_pattern = make_generation_pattern(IFN)
+    ST = SetTimes()
+    UI = UserInfo(options)
 
-    options.month = 1
-    ST = SetTimes(options, IFN)
-    UI = UserInfo(options, IFN, ST, Gen_prob_pattern)
+    for m in range(1, 13, 1):
+        options.month = m
+        ST.main(options, IFN)
+        UI.main(options, IFN, ST)
 
-    auction_book, users_book = market_clearing(
-        options,
-        IFN,
-        ST,
-        UI
-    )
+        auction_book, users_book = market_clearing(
+            options,
+            IFN,
+            ST,
+            UI
+        )
 
+        UI.auction_book.update(auction_book)
+        UI.users_book.update(users_book)
 
+        UI.res_info(options, ST)
 
+    UI.save_res(month=None)
 
     # 이후, prosumer, non-prosumer, utility 별 B/C ratio 산정하기
     # b/c ratio 산정에 대해서는 아래와 같음
