@@ -1,5 +1,6 @@
 import copy
 import random
+import math
 from datetime import timedelta, datetime
 
 import numpy as np
@@ -20,66 +21,91 @@ def _set_block_step(net_ToC, tariff_season):
 
 
 def _bid_by_strategy(
-        options:ProbOptions,
+        options: ProbOptions,
         player_info,
         strategy,
-        clearing_price=None
+        clearing_price=None,
+        open_num=0
 ):
+    def _bid_marginal(player_info):
+        bid_pool = dict()
+        for u in random.sample(list(player_info.keys()), len(player_info)):
+            count = 1
+            for i in range(1, abs(player_info[u]['quantity']) + 1, 1):
+                if player_info[u]['quantity'] > 0:
+                    bid_pool[f"{u},{i},{count}"] = \
+                        player_info[u]['lower_price']
+                else:
+                    bid_pool[f"{u},{i},{count}"] = \
+                        player_info[u]['upper_price']
+
+                count += 1
+
+        return pd.DataFrame(bid_pool.values(), index=bid_pool.keys(), columns=['bid'])
+
     def _bid_randomly(player_info):
         bid_pool = dict()
         for u in random.sample(list(player_info.keys()), len(player_info)):
             count = 1
-            for i in [options.trading_unit_amount] * int(round(abs(player_info[u]['quantity']) / options.trading_unit_amount, 0)):
+            for i in range(1, abs(player_info[u]['quantity']) + 1, 1):
                 bid_pool[f"{u},{i},{count}"] = \
                     np.random.uniform(player_info[u]['lower_price'], player_info[u]['upper_price'])
                 count += 1
         return pd.DataFrame(bid_pool.values(), index=bid_pool.keys(), columns=['bid'])
 
-    def _bid_update(player_info):
+    def _bid_update(player_info, clearing_price):
         """
         if historic bid >= historic clearing price
-         - buyer:
+
         """
         bid_pool = dict()
         for u in random.sample(list(player_info.keys()), len(player_info)):
-            if player_info[u]['historic_bid'] is np.nan:
+            if player_info[u]["quantity"] == 0:
+                continue
+            if clearing_price is None:
+                # 구매자면 clearing price를 하한값으로
+                if player_info[u]["quantity"] > 0:
+                    clearing_price = player_info[u]['upper_price']
+                else:
+                    clearing_price = player_info[u]['lower_price']
+
+            else:
                 pass
 
-            elif clearing_price <= player_info[u]['historic_bid'] <= player_info[u]['upper_price']:
-                adjusted = \
-                    player_info[u]['historic_bid'] - \
-                    (player_info[u]['historic_bid'] - clearing_price) * options.extract_margin_rate()
-                for i in range(abs(player_info[u]['quantity'])):
-                    bid_pool[f"{u},{i},{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"] = \
-                        np.random.uniform(
-                            low=player_info[u]['lower_price'],
-                            high=adjusted
-                        )
+            count = 1
+            if clearing_price <= player_info[u]['historic_bid'] <= player_info[u]['upper_price']:
+                for i in range(1, abs(player_info[u]['quantity']) + 1, 1):
+                    margin_rate = abs(np.random.normal(options.margin_rate_avr, options.margin_rate_sd))
+                    adjusted = \
+                        player_info[u]['historic_bid'] - \
+                        (player_info[u]['historic_bid'] - clearing_price) * margin_rate
+
+                    if adjusted < player_info[u]['lower_price']:
+                        adjusted = player_info[u]['lower_price']
+
+                    bid_pool[f"{u},{i},{count}"] = adjusted
+
 
             elif player_info[u]['historic_bid'] <= clearing_price <= player_info[u]['upper_price']:
-                adjusted = \
-                    player_info[u]['historic_bid'] + \
-                    (clearing_price - player_info[u]['historic_bid']) * options.extract_margin_rate()
-                for i in range(abs(player_info[u]['quantity'])):
-                    bid_pool[f"{u},{i},{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"] = \
-                        np.random.uniform(
-                            low=adjusted,
-                            high=player_info[u]['upper_price']
-                        )
+                for i in range(1, abs(player_info[u]['quantity']) + 1, 1):
+                    margin_rate = abs(np.random.normal(options.margin_rate_avr, options.margin_rate_sd))
+                    adjusted = \
+                        player_info[u]['historic_bid'] + \
+                        (clearing_price - player_info[u]['historic_bid']) * margin_rate
 
-            elif player_info[u]['historic_bid'] <= player_info[u]['upper_price'] <= clearing_price:
-                adjusted = \
-                    player_info[u]['historic_bid'] + \
-                    (clearing_price - player_info[u]['historic_bid']) * options.extract_margin_rate()
-                # 조절된 값이 상한 입찰가를 초과할 경우, 입찰가는 상한입찰가로 입찰하도록 설정
-                if adjusted > player_info[u]['upper_price']:
-                    adjusted = player_info[u]['upper_price']
-                for i in range(abs(player_info[u]['quantity'])):
-                    bid_pool[f"{u},{i},{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"] = \
-                        np.random.uniform(
-                            low=adjusted,
-                            high=player_info[u]['upper_price']
-                        )
+                    if adjusted > player_info[u]['upper_price']:
+                        adjusted = player_info[u]['upper_price']
+
+                    bid_pool[f"{u},{i},{count}"] = adjusted
+
+            # clearing price가 상한값보다 클 경우 다음 auction에서는 상한값으로 제시
+            elif player_info[u]['upper_price'] < clearing_price:
+                for i in range(1, abs(player_info[u]['quantity']) + 1, 1):
+                    bid_pool[f"{u},{i},{count}"] = player_info[u]['upper_price']
+
+            elif clearing_price < player_info[u]['lower_price']:
+                for i in range(1, abs(player_info[u]['quantity']) + 1, 1):
+                    bid_pool[f"{u},{i},{count}"] = player_info[u]['lower_price']
 
             else:
                 print("error: 알 수 없는 조건")
@@ -91,6 +117,7 @@ def _bid_by_strategy(
                     c=clearing_price
                 )
                 )
+            count += 1
 
         if bid_pool == dict():
             return pd.DataFrame([], index=bid_pool.keys(), columns=['bid'])
@@ -101,10 +128,11 @@ def _bid_by_strategy(
         return _bid_randomly(player_info)
 
     elif strategy == 'Update margin':
-        if clearing_price is None:
-            return _bid_randomly(player_info)
+        if clearing_price is None and open_num == 0:
+            # return _bid_randomly(player_info)
+            return _bid_marginal(player_info)
         else:
-            return _bid_update(player_info)
+            return _bid_update(player_info, clearing_price)
 
 
 def _market_price(
@@ -114,30 +142,36 @@ def _market_price(
 ):
 
     # breakeven index 결정 (동일 index의 구매자의 입찰가가 판매자의 입찰가보다 큰 것 중 가장 높은 index)
-    if bid_buyer_pool.shape[0] >= bid_seller_pool.shape[0]:
-        pass_margin = bid_seller_pool.shape[0]
-        breakeven_index = np.where(bid_buyer_pool.iloc[:pass_margin, 0].values >= bid_seller_pool.iloc[:, 0].values)[0][-1]
+    try:
+        if bid_buyer_pool.shape[0] >= bid_seller_pool.shape[0]:
+            pass_margin = bid_seller_pool.shape[0]
+            breakeven_index = np.where(bid_buyer_pool.iloc[:pass_margin, 0].values >= bid_seller_pool.iloc[:, 0].values)[0][-1]
 
-    else:
-        pass_margin = bid_buyer_pool.shape[0]
-        breakeven_index = np.where(bid_buyer_pool.iloc[:, 0].values >= bid_seller_pool.iloc[:pass_margin, 0].values)[0][-1]
-
-    if auction_mechanism == 'VCG':
-        buyer_breakeven_price = bid_buyer_pool.iloc[breakeven_index, 0]
-        seller_breakeven_price = bid_seller_pool.iloc[breakeven_index, 0]
-
-        if breakeven_index + 1 == bid_buyer_pool.shape[0]:
-            buyer_next_price = bid_buyer_pool.iloc[breakeven_index, 0]
         else:
-            buyer_next_price = bid_buyer_pool.iloc[breakeven_index + 1, 0]
+            pass_margin = bid_buyer_pool.shape[0]
+            breakeven_index = np.where(bid_buyer_pool.iloc[:, 0].values >= bid_seller_pool.iloc[:pass_margin, 0].values)[0][-1]
 
-        if breakeven_index + 1 == bid_seller_pool.shape[0]:
-            seller_next_price = bid_seller_pool.iloc[breakeven_index, 0]
-        else:
-            seller_next_price = bid_seller_pool.iloc[breakeven_index + 1, 0]
+        if auction_mechanism == 'VCG':
+            buyer_breakeven_price = bid_buyer_pool.iloc[breakeven_index, 0]
+            seller_breakeven_price = bid_seller_pool.iloc[breakeven_index, 0]
 
-        buyer_market_price = max(seller_breakeven_price, buyer_next_price)
-        seller_market_prcie = min(seller_next_price, buyer_breakeven_price)
+            if breakeven_index + 1 == bid_buyer_pool.shape[0]:
+                buyer_next_price = bid_buyer_pool.iloc[breakeven_index, 0]
+            else:
+                buyer_next_price = bid_buyer_pool.iloc[breakeven_index + 1, 0]
+
+            if breakeven_index + 1 == bid_seller_pool.shape[0]:
+                seller_next_price = bid_seller_pool.iloc[breakeven_index, 0]
+            else:
+                seller_next_price = bid_seller_pool.iloc[breakeven_index + 1, 0]
+
+            buyer_market_price = max(seller_breakeven_price, buyer_next_price)
+            seller_market_prcie = min(seller_next_price, buyer_breakeven_price)
+    except IndexError:
+        buyer_market_price = None
+        seller_market_prcie = None
+        breakeven_index = "clearing fail"
+
 
     return buyer_market_price, seller_market_prcie, breakeven_index
 
@@ -148,7 +182,7 @@ def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: 
     users 옥션 결과 book frame 생성 및 초기값 입력
     """
     users_book = dict()
-    for d, h in ST.date_list:
+    for d, h in ST.date_list_resol:
         open_day = (ST.first_day + timedelta(days=d - 1)).strftime("%m-%d")
         date = f"{open_day}-{h}"
         users_book[date] = dict()
@@ -165,7 +199,7 @@ def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: 
     """
     auction_book = dict()
     date_list = []
-    for d, h in ST.date_list:
+    for d, h in ST.date_list_resol:
         open_day = (ST.first_day + timedelta(days=d-1)).strftime("%m-%d")
         date = f"{open_day}-{h}"
 
@@ -175,7 +209,7 @@ def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: 
         # auction 개장 "일자 - 거래 시점"에 대한 book 생성
         auction_book[date] = dict()
 
-        # 시장 평균 가격 (평균 SMP)
+        # 시장 가격 (SMP)
         market_price = IFN.smp_data.loc[open_day, f"{h}h"]
 
         # auction book으로 거래시점 별 평균 시장 가격 입력
@@ -188,8 +222,11 @@ def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: 
         """
         for user in UI.Users.keys():
             quantity = \
-                round(
-                    UI.Users[user]['Electricity_Consumption'][d, h] - UI.Users[user]['Generation'][d, h], 1
+                int(
+                    sum(
+                        UI.Users[user]['Electricity_Consumption'][d, _h] - UI.Users[user]['Generation'][d, _h]
+                        for _h in ST.trading_time[h]
+                    )
                 )
 
 
@@ -239,14 +276,11 @@ def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: 
 
         # 거래량 산출
         trading_amount = \
-            round(
-                abs(
-                    sum(
-                        [auction_book[date]['sellers'][u]['quantity']
-                         for u in auction_book[date]['sellers'].keys()]
-                    )
-                ),
-                1
+            abs(
+                sum(
+                    [auction_book[date]['sellers'][u]['quantity']
+                     for u in auction_book[date]['sellers'].keys()]
+                )
             )
 
         # 판매 물량이 없을 경우, 거래 종료
@@ -266,14 +300,16 @@ def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: 
                     options=options,
                     player_info=buyer_info_temp,
                     strategy=options.bidding_strategy,
-                    clearing_price=buyer_clearing_price
+                    clearing_price=buyer_clearing_price,
+                    open_num=open_num
                 )
 
                 bid_seller_pool = _bid_by_strategy(
                     options=options,
                     player_info=seller_info_temp,
                     strategy=options.bidding_strategy,
-                    clearing_price=seller_clearing_price
+                    clearing_price=seller_clearing_price,
+                    open_num=open_num
                 )
 
                 # 판매자의 ask 가격이 상한가격이 치우치도록 한다면?
@@ -292,78 +328,80 @@ def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: 
                     bid_seller_pool.sort_values('bid', ascending=True)
 
                 # market clearing 방식에 따른 market price 결정
-                try:
-                    buyer_clearing_price, seller_clearing_price, breakeven_index = \
-                        _market_price(
-                            options.auction_mechanism,
-                            bid_buyer_pool,
-                            bid_seller_pool
-                        )
-                # 구매자 또는 판매자의 모든 입찰가가 counterpart의 입찰가와 매칭되지 않을 경우
-                except IndexError:
-                    break
 
-                """
-                낙찰된 구매자 및 판매자의 정산
-                """
-                # buyer-Market-clearing [결정된 시장 가격에 따른 clearing 단계]
-                winning_player = []
+                buyer_clearing_price, seller_clearing_price, breakeven_index = \
+                    _market_price(
+                        auction_mechanism=options.auction_mechanism,
+                        bid_buyer_pool=bid_buyer_pool,
+                        bid_seller_pool=bid_seller_pool
+                    )
 
                 bid_buyer_pool['name'] = \
                     [x.split(',')[0] for x in list(bid_buyer_pool.index)]
-                buyer_count_df = bid_buyer_pool.iloc[:breakeven_index+1, :].groupby('name').count() * options.trading_unit_amount
-                for user in buyer_count_df.index:
-                    users_book[date][user]['Q_winning'].append(
-                        buyer_count_df.loc[user, 'bid']
-                    )
-                    users_book[date][user]['P_winning'].append(
-                        buyer_count_df.loc[user, 'bid'] * buyer_clearing_price
-                    )
-                    users_book[date][user]['cummul_Q'] = \
-                        sum(users_book[date][user]['Q_winning'])
-                    winning_player.append(user)
-
-                # seller-Market-clearing [결정된 시장 가격에 따른 clearing 단계]
                 bid_seller_pool['name'] = \
                     [x.split(',')[0] for x in list(bid_seller_pool.index)]
-                seller_count_df = bid_seller_pool.iloc[:breakeven_index+1, :].groupby('name').count() * options.trading_unit_amount
-                for user in seller_count_df.index:
-                    users_book[date][user]['Q_winning'].append(
-                        - seller_count_df.loc[user, 'bid']
-                    )
-                    users_book[date][user]['P_winning'].append(
-                        - seller_count_df.loc[user, 'bid'] * seller_clearing_price
-                    )
-                    users_book[date][user]['cummul_Q'] = \
-                        sum(users_book[date][user]['Q_winning'])
-                    winning_player.append(user)
+                # 구매자 또는 판매자의 모든 입찰가가 counterpart의 입찰가와 매칭되지 않을 경우
+                if breakeven_index == "clearing fail":
+                    pass
+                else:
+                    """
+                    낙찰된 구매자 및 판매자의 정산
+                    """
+                    # buyer-Market-clearing [결정된 시장 가격에 따른 clearing 단계]
+                    winning_player = []
 
-                for user in list(set(UI.Users.keys()) - set(winning_player)):
-                    users_book[date][user]['Q_winning'].append(
-                        0
-                    )
-                    users_book[date][user]['P_winning'].append(
-                        0
-                    )
-                    users_book[date][user]['cummul_Q'] = \
-                        sum(users_book[date][user]['Q_winning'])
+                    buyer_count_df = bid_buyer_pool.iloc[:breakeven_index+1, :].groupby('name').count()
+                    for user in buyer_count_df.index:
+                        users_book[date][user]['Q_winning'].append(
+                            buyer_count_df.loc[user, 'bid']
+                        )
+                        users_book[date][user]['P_winning'].append(
+                            buyer_count_df.loc[user, 'bid'] * buyer_clearing_price
+                        )
+                        users_book[date][user]['cummul_Q'] = \
+                            sum(users_book[date][user]['Q_winning'])
+                        winning_player.append(user)
+
+                    # seller-Market-clearing [결정된 시장 가격에 따른 clearing 단계]
+
+                    seller_count_df = bid_seller_pool.iloc[:breakeven_index+1, :].groupby('name').count()
+                    for user in seller_count_df.index:
+                        users_book[date][user]['Q_winning'].append(
+                            - seller_count_df.loc[user, 'bid']
+                        )
+                        users_book[date][user]['P_winning'].append(
+                            - seller_count_df.loc[user, 'bid'] * seller_clearing_price
+                        )
+                        users_book[date][user]['cummul_Q'] = \
+                            sum(users_book[date][user]['Q_winning'])
+                        winning_player.append(user)
+
+                    for user in list(set(UI.Users.keys()) - set(winning_player)):
+                        users_book[date][user]['Q_winning'].append(
+                            0
+                        )
+                        users_book[date][user]['P_winning'].append(
+                            0
+                        )
+                        users_book[date][user]['cummul_Q'] = \
+                            sum(users_book[date][user]['Q_winning'])
 
                 """
                 이전 market에 입찰가 중 평균 입찰가를 historic bid로 결정
                 """
                 for user in buyer_info_temp.keys():
                     buyer_info_temp[user]['quantity'] = \
-                        auction_book[date_resolution]['buyers'][user]['quantity'] - \
-                        users_book[date_resolution][user]['cummul_Q']
+                        auction_book[date]['buyers'][user]['quantity'] - \
+                        users_book[date][user]['cummul_Q']
                     buyer_info_temp[user]['historic_bid'] = \
-                        bid_buyer_pool[bid_buyer_pool.name == user]['bid'].mean()
+                        round(bid_buyer_pool[bid_buyer_pool.name == user]['bid'].mean(), 5)
                 for user in seller_info_temp.keys():
                     seller_info_temp[user]['quantity'] = \
-                        auction_book[date_resolution]['sellers'][user]['quantity'] - \
-                        users_book[date_resolution][user]['cummul_Q']
+                        auction_book[date]['sellers'][user]['quantity'] - \
+                        users_book[date][user]['cummul_Q']
                     seller_info_temp[user]['historic_bid'] = \
-                        bid_seller_pool[bid_seller_pool.name == user]['bid'].mean()
+                        round(bid_seller_pool[bid_seller_pool.name == user]['bid'].mean(), 5)
 
-        date_list.append(date_resolution)
+        date_list.append(date)
 
     return auction_book, users_book

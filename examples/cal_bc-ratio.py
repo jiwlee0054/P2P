@@ -34,7 +34,7 @@ if __name__ == '__main__':
 
         UI.res_info(options, ST)
 
-    UI.save_res(month=None)
+    # UI.save_res(month=None, typ=2, name="230808")
 
     # 이후, prosumer, non-prosumer, utility 별 B/C ratio 산정하기
     # b/c ratio 산정에 대해서는 아래와 같음

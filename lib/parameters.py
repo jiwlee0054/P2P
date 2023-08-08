@@ -27,8 +27,7 @@ class ProbOptions:
         self.demand_noise_dist_deviation_ratio = 0.3
         self.trading_time_option = 'Time-of-Use'
 
-        self.payback_year = 104
-        self.trading_unit_amount = 1
+        self.payback_year = 10
         """
         
         Vickrey-Clark-Groves(VCG)
@@ -36,7 +35,7 @@ class ProbOptions:
         self.auction_mechanism = 'VCG'
 
         # 거래 시점별 거래 반복 횟수
-        self.number_of_market_open = 5
+        self.number_of_market_open = 100
         """
         입찰 전략 선택
         1. Randomly
@@ -46,6 +45,8 @@ class ProbOptions:
 
         self.loc_data = f"data"
 
+        self.margin_rate_avr = 0.2
+        self.margin_rate_sd = 0.15
     def extract_margin_rate(self):
         return abs(np.random.normal(0.2, 0.15))
 
@@ -374,7 +375,10 @@ class UserInfo:
             "옥션 후 전력량요금",
             "상계거래 후 순 조달량",
             "상계거래 후 누진단계",
-            "상계거래 후 전력량요금"
+            "상계거래 후 전력량요금",
+            "옥션 후 총 비용",
+            "상계거래 후 총 비용",
+            "편익"
         ]
 
         _index = self.Users.keys()
@@ -396,11 +400,11 @@ class UserInfo:
 
             info_df.at[u, "구매 낙찰량"] = sum(
                 [
-                    sum(
-                        self.users_book[date][u]["Q_winning"]
-                    )
+                    sum(self.users_book[date][u]["Q_winning"])
                     for date in ST.date_list_resol_mdh
-                    if u in self.auction_book[date]["buyers"].keys()]
+                    if u in self.auction_book[date]["buyers"].keys() and sum(self.users_book[date][u]["Q_winning"]) > 0
+                ]
+
             )
 
             info_df.at[u, "구매 낙찰가격"] = sum(
@@ -409,41 +413,29 @@ class UserInfo:
                         self.users_book[date][u]["P_winning"]
                     )
                     for date in ST.date_list_resol_mdh
-                    if u in self.auction_book[date]["buyers"].keys()]
+                    if u in self.auction_book[date]["buyers"].keys() and sum(self.users_book[date][u]["Q_winning"]) > 0
+                ]
             )
 
             info_df.at[u, "판매 낙찰량"] = sum(
                 [
                     sum(self.users_book[date][u]["Q_winning"])
                     for date in ST.date_list_resol_mdh
-                    if u in self.auction_book[date]["sellers"].keys()
+                    if u in self.auction_book[date]["sellers"].keys() and sum(self.users_book[date][u]["Q_winning"]) < 0
                 ]
             )
 
             info_df.at[u, "판매 낙찰가격"] = \
                 sum([
-                        sum(
-                            self.users_book[date][u]["P_winning"]
-                        )
-                        for date in ST.date_list_resol_mdh
-                        if u in self.auction_book[date]["sellers"].keys()
+                    sum(
+                        self.users_book[date][u]["P_winning"]
+                    )
+                    for date in ST.date_list_resol_mdh
+                    if u in self.auction_book[date]["sellers"].keys() and sum(self.users_book[date][u]["Q_winning"]) < 0
                 ]
                 )
 
-            info_df.at[u, '미 판매량'] = sum(
-                [
-                    self.Users[u]["Feed_in"][int(date.split('-')[1]), int(date.split('-')[2])] +
-                    sum(self.users_book[date][u]["Q_winning"])
-                    for date in ST.date_list_resol_mdh
-                    if self.Users[u]["Gen_bin"] == 1 and sum(self.users_book[date][u]["Q_winning"]) < 0
-                ]
-            ) + sum(
-                [
-                    self.Users[u]["Feed_in"][int(date.split('-')[1]), int(date.split('-')[2])]
-                    for date in ST.date_list_resol_mdh
-                    if self.Users[u]["Gen_bin"] == 1 and sum(self.users_book[date][u]["Q_winning"]) >= 0
-                ]
-            )
+            info_df.at[u, '미 판매량'] = info_df.at[u, '역송량'] + info_df.at[u, "판매 낙찰량"]
 
             info_df.at[u, "월간 평균 SMP"] = np.average(
                 [
@@ -460,20 +452,11 @@ class UserInfo:
                 [
                     self.auction_book[date]["market-price"] *
                     (
-                            self.Users[u]["Feed_in"][int(date.split('-')[1]), int(date.split('-')[2])] +
+                            sum(self.Users[u]["Feed_in"][int(date.split('-')[1]), _h] for _h in ST.trading_time[int(date.split('-')[2])]) +
                             sum(self.users_book[date][u]["Q_winning"])
                     )
                     for date in ST.date_list_resol_mdh
-                    if self.Users[u]["Gen_bin"] == 1 and sum(self.users_book[date][u]["Q_winning"]) < 0
-                ]
-            ) - sum(
-                [
-                    self.auction_book[date]["market-price"] *
-                    (
-                        self.Users[u]["Feed_in"][int(date.split('-')[1]), int(date.split('-')[2])]
-                    )
-                    for date in ST.date_list_resol_mdh
-                    if self.Users[u]["Gen_bin"] == 1 and sum(self.users_book[date][u]["Q_winning"]) >= 0
+                    if self.Users[u]["Gen_bin"] == 1
                 ]
             )
 
@@ -524,9 +507,19 @@ class UserInfo:
 
             info_df.at[u, "상계거래 후 전력량요금"] = energy_charge
 
+            info_df.at[u, "옥션 후 총 비용"] = \
+                info_df.at[u, "구매 낙찰가격"] + info_df.at[u, "판매 낙찰가격"] + info_df.at[u, "옥션 후 SMP 보상요금"] + \
+                info_df.at[u, "기본요금"] + info_df.at[u, "옥션 후 전력량요금"]
+
+            info_df.at[u, "상계거래 후 총 비용"] = \
+                info_df.at[u, "상계거래 후 잔여크레딧 보상요금"] + info_df.at[u, "기본요금"] + info_df.at[u, "상계거래 후 전력량요금"]
+
+            info_df.at[u, "편익"] = \
+                info_df.at[u, "상계거래 후 총 비용"] - info_df.at[u, "옥션 후 총 비용"]
+
         self.res_book[options.month] = info_df
 
-    def save_res(self, month=None, typ=None):
+    def save_res(self, month=None, typ=None, name=None):
         """
 
         month :
@@ -555,4 +548,4 @@ class UserInfo:
                 concat_list.append(self.res_book[m])
 
             df_all = pd.concat(concat_list, axis=0)
-            df_all.to_excel("results/number-{n}_month-all.xlsx".format(n=len(self.Users.keys())))
+            df_all.to_excel(f"results/number-{len(self.Users.keys())}_month-all_{name}.xlsx")
