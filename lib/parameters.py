@@ -389,7 +389,7 @@ class UserInfo:
             info_df.at[u, "순 조달량"] = sum(self.Users[u]["Net_consumption"].values())
             info_df.at[u, "누진단계"] = self.Users[u]["Block_step_old"]
             info_df.at[u, "역송량"] = sum(self.Users[u]['Feed_in'].values())
-            info_df.at[u, "판매량"] = - sum([int(v) for v in self.Users[u]["Feed_in"].values()])
+            info_df.at[u, "판매량"] = - sum([int(sum(self.Users[u]["Feed_in"][int(date.split('-')[1]), _h] for _h in ST.trading_time[int(date.split('-')[2])])) for date in ST.date_list_resol_mdh])
 
             amount = info_df.at[u, "순 조달량"] - info_df.at[u, "역송량"]
             if amount >= 0:
