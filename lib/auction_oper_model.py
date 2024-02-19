@@ -199,6 +199,7 @@ def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: 
     """
     auction_book = dict()
     date_list = []
+    historic_bid = dict()
     for d, h in ST.date_list_resol:
         open_day = (ST.first_day + timedelta(days=d-1)).strftime("%m-%d")
         date = f"{open_day}-{h}"
@@ -208,6 +209,10 @@ def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: 
         """
         # auction 개장 "일자 - 거래 시점"에 대한 book 생성
         auction_book[date] = dict()
+
+        historic_bid[date] = dict()
+        historic_bid[date]["buyers"] = dict()
+        historic_bid[date]["sellers"] = dict()
 
         # 시장 가격 (SMP)
         market_price = IFN.smp_data.loc[open_day, f"{h}h"]
@@ -221,29 +226,35 @@ def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: 
         옥션 참가자(buyer, seller)의 각 입찰량 및 입찰상한가격, 입찰하한가격 결정 
         """
         for user in UI.Users.keys():
-            quantity = \
-                int(
+            quantity_out = \
+                - int(
                     sum(
-                        UI.Users[user]['Electricity_Consumption'][d, _h] - UI.Users[user]['Generation'][d, _h]
+                        UI.Users[user]["Feed_in"][d, _h]
                         for _h in ST.trading_time[h]
                     )
                 )
-
+            quantity_in = \
+                int(
+                    sum(
+                        UI.Users[user]["Net_consumption"][d, _h]
+                        for _h in ST.trading_time[h]
+                    )
+                )
 
             # resolution된 시간대의 netload의 합으로 판매량 결정
             # 동일 resolution에서는 자신의 전력량을 낮춘다고 가정
             # 즉, 공급과잉량에 대해서 판매자는 시장가격으로 정산을 받거나 또는 구매자에게 파는 것만을 고려해야 함.
             # 자신의 누진단계를 낮추도록 할 수 없음. (즉, 상계거래 폐지)
 
-            if quantity < 0:
+            if quantity_out < 0:
                 auction_book[date]['sellers'][user] = \
                     {
-                        'quantity': quantity,
+                        'quantity': quantity_out,
                         'upper_price': ST.highest_block_price,
                         'lower_price': max(UI.Users[u]["Min_generation_price"], market_price)
                     }
 
-            else:
+            elif quantity_in > 0:
                 # 낙찰량(구매자에서 낙찰된 양)을 뺀 순소비량에 대해서 누진단계 결정
                 block_name = \
                     _set_block_step(
@@ -268,11 +279,10 @@ def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: 
 
                 auction_book[date]['buyers'][user] = \
                     {
-                        'quantity': quantity,
+                        'quantity': quantity_in,
                         'upper_price': upper_price,
                         'lower_price': lower_price
                     }
-
 
         # 거래량 산출
         trading_amount = \
@@ -311,14 +321,18 @@ def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: 
                     clearing_price=seller_clearing_price,
                     open_num=open_num
                 )
-
-                # 판매자의 ask 가격이 상한가격이 치우치도록 한다면?
-                # 구매자는 반대로 bid 가격이 하한가격에 치우치도록?
-                # clearing이 안된다면, 계속 margin을 조정하면서 최대 낙찰량이 결정되도록 한다면?
-                # 구매자 과도한 보상을 얻는걸 막을 수 있을 것 같음
+                bid_buyer_pool['name'] = \
+                    [x.split(',')[0] for x in list(bid_buyer_pool.index)]
+                bid_seller_pool['name'] = \
+                    [x.split(',')[0] for x in list(bid_seller_pool.index)]
 
                 if bid_buyer_pool.shape[0] == 0 or bid_seller_pool.shape[0] == 0:
                     break
+
+                for user in bid_buyer_pool.index:
+                    historic_bid[date]["buyers"][f"{user.split(',')[0]},{user.split(',')[1]}"] = bid_buyer_pool.loc[user, "bid"]
+                for user in bid_seller_pool.index:
+                    historic_bid[date]["sellers"][f"{user.split(',')[0]},{user.split(',')[1]}"] = bid_seller_pool.loc[user, "bid"]
 
                 # natural ordering을 통한 입찰가 정렬 (buyer: descending order, seller: descending order)
                 bid_buyer_pool = \
@@ -336,10 +350,6 @@ def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: 
                         bid_seller_pool=bid_seller_pool
                     )
 
-                bid_buyer_pool['name'] = \
-                    [x.split(',')[0] for x in list(bid_buyer_pool.index)]
-                bid_seller_pool['name'] = \
-                    [x.split(',')[0] for x in list(bid_seller_pool.index)]
                 # 구매자 또는 판매자의 모든 입찰가가 counterpart의 입찰가와 매칭되지 않을 경우
                 if breakeven_index == "clearing fail":
                     pass
@@ -395,6 +405,7 @@ def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: 
                         users_book[date][user]['cummul_Q']
                     buyer_info_temp[user]['historic_bid'] = \
                         round(bid_buyer_pool[bid_buyer_pool.name == user]['bid'].mean(), 5)
+
                 for user in seller_info_temp.keys():
                     seller_info_temp[user]['quantity'] = \
                         auction_book[date]['sellers'][user]['quantity'] - \
@@ -404,4 +415,4 @@ def market_clearing(options: ProbOptions, IFN: ReadInputData, ST: SetTimes, UI: 
 
         date_list.append(date)
 
-    return auction_book, users_book
+    return auction_book, users_book, historic_bid

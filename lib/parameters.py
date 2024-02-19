@@ -20,7 +20,6 @@ class ProbOptions:
             self.Number_Of_Prosumers = self.input_data[self.input_data.capacity > 0].shape[0]
             self.Number_Of_Consumers = self.input_data[self.input_data.capacity == 0].shape[0]
 
-
         self.year = 2021
         self.month = 1
 
@@ -79,9 +78,11 @@ class ReadInputData:
 
         self.tariff_table = pd.read_excel(f"{options.loc_data}/tariff_table.xlsx", sheet_name='주택용(22.10.01)', index_col=0)
 
-        smp_data = pd.read_excel(f"{options.loc_data}/smp_land_2019.xlsx", sheet_name='smp_land_2019', index_col=0, header=1)
-        smp_index = [f"{k.replace('2019', '')[0:2]}-{k.replace('2019', '')[2:]}" for k in smp_data.index.astype('str')]
-        self.smp_data = pd.DataFrame(smp_data.values, index=smp_index, columns=smp_data.columns)
+        smp_data = pd.read_excel(f"{options.loc_data}/HOME_전력거래_계통한계가격_시간별SMP_{options.year}.xlsx",
+                                 sheet_name='Sheet1', index_col=0, header=0)
+        smp_index = [f"{k.split('/')[1]}-{k.split('/')[2]}" for k in smp_data.index.astype('str')]
+        smp_columns = [f"{h}h" for h in range(1, 25, 1)]
+        self.smp_data = pd.DataFrame(smp_data.loc[:, "01시":"24시"].values, index=smp_index, columns=smp_columns)
 
         self.PF_mean, self.PF_sigma = 0.2, 0.15
 
@@ -169,6 +170,7 @@ class UserInfo:
         self.auction_book = dict()
         self.users_book = dict()
         self.res_book = dict()
+        self.historic_bid = dict()
         # Users SET 만들기
         self.make_users_set(options)
 
@@ -356,6 +358,7 @@ class UserInfo:
 
     def res_info(self, options:ProbOptions, ST:SetTimes):
         _column = [
+            "설치용량",
             "순 조달량",
             "누진단계",
             "역송량",
@@ -386,10 +389,21 @@ class UserInfo:
         info_df = pd.DataFrame(index=_index, columns=_column)
 
         for u in _index:
+            info_df.at[u, "설치용량"] = self.Users[u]["Installed_Cap"]
             info_df.at[u, "순 조달량"] = sum(self.Users[u]["Net_consumption"].values())
             info_df.at[u, "누진단계"] = self.Users[u]["Block_step_old"]
             info_df.at[u, "역송량"] = sum(self.Users[u]['Feed_in'].values())
-            info_df.at[u, "판매량"] = - sum([int(sum(self.Users[u]["Feed_in"][int(date.split('-')[1]), _h] for _h in ST.trading_time[int(date.split('-')[2])])) for date in ST.date_list_resol_mdh])
+            info_df.at[u, "판매량"] = \
+                - sum(
+                    [
+                        int(
+                            sum(
+                                self.Users[u]["Feed_in"][int(date.split('-')[1]), _h]
+                                for _h in ST.trading_time[int(date.split('-')[2])]
+                            )
+                        ) for date in ST.date_list_resol_mdh
+                    ]
+                )
 
             amount = info_df.at[u, "순 조달량"] - info_df.at[u, "역송량"]
             if amount >= 0:
@@ -548,4 +562,50 @@ class UserInfo:
                 concat_list.append(self.res_book[m])
 
             df_all = pd.concat(concat_list, axis=0)
+
+            df_benefit = pd.DataFrame(index=["프로슈머 편익(종합)", "컨슈머 편익(종합)", "프로슈머-컨슈머 편익차이(종합)",
+                                             "유틸리티 손실(옥션)", "유틸리티 수익(옥션)", "유틸리티 수익(상계거래)",
+                                             "유틸리티 편익(종합)", "유틸리티 수익 변화율", "역송량", "판매량", "판매 낙찰량"], columns=["Value"])
+            df_benefit.loc["프로슈머 편익(종합)", "Value"] = df_all[df_all["설치용량"] > 0]["편익"].sum()
+            df_benefit.loc["컨슈머 편익(종합)", "Value"] = df_all[df_all["설치용량"] == 0]["편익"].sum()
+            df_benefit.loc["프로슈머-컨슈머 편익차이(종합)", "Value"] = \
+                df_benefit.loc["프로슈머 편익(종합)", "Value"] - df_benefit.loc["컨슈머 편익(종합)", "Value"]
+            df_benefit.loc["유틸리티 손실(옥션)", "Value"] = df_all["구매 낙찰가격"].sum() + df_all["판매 낙찰가격"].sum()
+            df_benefit.loc["유틸리티 수익(옥션)", "Value"] = \
+                df_all["옥션 후 SMP 보상요금"].sum() + \
+                df_all["기본요금"].sum() + \
+                df_all["옥션 후 전력량요금"].sum() + \
+                df_benefit.loc["유틸리티 손실(옥션)", "Value"]
+            df_benefit.loc["유틸리티 수익(상계거래)", "Value"] = \
+                df_all["상계거래 후 잔여크레딧 보상요금"].sum() + \
+                df_all["기본요금"].sum() + \
+                df_all["상계거래 후 전력량요금"].sum()
+            df_benefit.loc["유틸리티 편익(종합)", "Value"] = \
+                df_benefit.loc["유틸리티 수익(옥션)", "Value"] - df_benefit.loc["유틸리티 수익(상계거래)", "Value"]
+            df_benefit.loc["유틸리티 수익 변화율", "Value"] = \
+                (df_benefit.loc["유틸리티 수익(옥션)", "Value"] - df_benefit.loc["유틸리티 수익(상계거래)", "Value"]) / \
+                df_benefit.loc["유틸리티 수익(상계거래)", "Value"] * 100
+            df_benefit.loc["역송량", "Value"] = df_all["역송량"].sum()
+            df_benefit.loc["판매량", "Value"] = df_all["판매량"].sum()
+            df_benefit.loc["판매 낙찰량", "Value"] = df_all["판매 낙찰량"].sum()
+
             df_all.to_excel(f"results/number-{len(self.Users.keys())}_month-all_{name}.xlsx")
+            df_benefit.to_excel(f"results/number-{len(self.Users.keys())}_month-all_{name}_benefit 정리.xlsx")
+
+    def case1_smp_wp(self, name):
+        df = pd.DataFrame(index=self.users_book.keys(), columns=["SMP", "평균 판매자 낙찰가격", "최대 판매자 낙찰가격", "최소 판매자 낙찰가격"])
+
+        for date in df.index:
+            df.loc[date, "SMP"] = self.auction_book[date]["market-price"]
+            _p = sum([self.users_book[date][u]["P_winning"] for u in self.users_book[date]], [])
+            _p_seller = [abs(k) for k in _p if k < 0]
+            if len(_p_seller) > 0:
+                df.loc[date, "평균 판매자 낙찰가격"] = sum(_p_seller) / len(_p_seller)
+                df.loc[date, "최소 판매자 낙찰가격"] = min(_p_seller)
+                df.loc[date, "최대 판매자 낙찰가격"] = max(_p_seller)
+            else:
+                pass
+        df = df.dropna(axis=0)
+        df.to_excel(f"results/number-{len(self.Users.keys())}_month-all_{name}_Case1_SMP_WP.xlsx")
+
+    # def case1_total
